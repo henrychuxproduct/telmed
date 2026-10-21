@@ -391,7 +391,25 @@ class _AuthPageState extends State<AuthPage> {
             Align(
               alignment: Alignment.centerRight,
               child: TextButton(
-                onPressed: () {},
+                onPressed: () async {
+                  final String email = _emailController.text.trim();
+                  if (email.isEmpty) {
+                    setState(() => _serverError = 'Enter your email above first, then tap "Forgot Password?".');
+                    return;
+                  }
+                  final String? err = await _authService.sendPasswordReset(email);
+                  if (!mounted) return;
+                  if (err != null) {
+                    setState(() => _serverError = err);
+                  } else {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        backgroundColor: const Color(0xFF2D7D46),
+                        content: Text("If an account exists for $email, a reset link has been sent."),
+                      ),
+                    );
+                  }
+                },
                 child: Text("Forgot Password?", style: GoogleFonts.plusJakartaSans(color: const Color(0xFF2D7D46), fontWeight: FontWeight.bold)),
               ),
             ),
@@ -621,4 +639,4 @@ class _AuthPageState extends State<AuthPage> {
       ),
     );
   }
-} 
+}

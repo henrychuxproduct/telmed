@@ -2,7 +2,9 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'dart:math' as math;
 import 'dart:ui';
+import '../services/auth_service.dart';
 import '../services/signaling.dart';
 import 'digital_prescription_pad.dart';
 
@@ -15,6 +17,7 @@ class JoinOverlay extends StatefulWidget {
 
 class _JoinOverlayState extends State<JoinOverlay> {
   final Signaling _signaling = Signaling();
+  final AuthService _authService = AuthService();
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
 
@@ -28,12 +31,16 @@ class _JoinOverlayState extends State<JoinOverlay> {
   bool _showPrescriptionPad = false; // Controls prescription pad visibility
   
   String? _localMediaError;
+  String? _joinError;
+  bool _checkingAccess = true;
+  String? _accessError; // null = allowed
   String _connectionStatus = "Ready"; 
 
   @override
   void initState() {
     super.initState();
     _initRenderers();
+    _checkDoctorAccess();
 
     _signaling.onCallEnded = () {
       if (mounted && _isJoined) {
@@ -44,6 +51,27 @@ class _JoinOverlayState extends State<JoinOverlay> {
          Navigator.pop(context);
       }
     };
+  }
+
+  /// Client-side guard. (Real protection must ALSO live in Firestore rules.)
+  Future<void> _checkDoctorAccess() async {
+    final user = _authService.currentUser;
+    String? error;
+    if (user == null) {
+      error = 'Please sign in with a doctor account to view waiting patients.';
+    } else {
+      final profile = await _authService.getUserProfile(user.uid);
+      if (profile == null || profile['role'] != 'doctor') {
+        error = 'This portal is for registered doctors only.';
+      } else if (profile['isVerified'] == false) {
+        error = 'Your doctor account is awaiting verification by an administrator.';
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _accessError = error;
+      _checkingAccess = false;
+    });
   }
 
   Future<void> _initRenderers() async {
@@ -62,6 +90,7 @@ class _JoinOverlayState extends State<JoinOverlay> {
 
   @override
   void dispose() {
+    if (_isJoined) _signaling.hangUp(_localRenderer);
     _localRenderer.dispose();
     _remoteRenderer.dispose();
     super.dispose();
@@ -82,7 +111,11 @@ class _JoinOverlayState extends State<JoinOverlay> {
             children: [
               _buildHeader(),
               Expanded(
-                child: _isJoined ? _buildCallUI() : _buildQueueList(),
+                child: _isJoined
+                    ? _buildCallUI()
+                    : (_checkingAccess
+                        ? const Center(child: CircularProgressIndicator(color: Color(0xFF2D7D46)))
+                        : (_accessError != null ? _buildAccessDenied() : _buildQueueList())),
               ),
             ],
           ),
@@ -92,8 +125,9 @@ class _JoinOverlayState extends State<JoinOverlay> {
   }
 
   Widget _buildHeader() {
+    final bool compact = MediaQuery.of(context).size.width < 600;
     return Padding(
-      padding: const EdgeInsets.all(30),
+      padding: EdgeInsets.all(compact ? 16 : 30),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
@@ -115,10 +149,41 @@ class _JoinOverlayState extends State<JoinOverlay> {
     );
   }
 
+  Widget _buildAccessDenied() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 480),
+          padding: const EdgeInsets.all(30),
+          decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(30), border: Border.all(color: Colors.white12)),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.lock_outline, color: Color(0xFFF9A825), size: 50),
+              const SizedBox(height: 15),
+              Text(_accessError!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 16, height: 1.4)),
+              if (_authService.currentUser == null) ...[
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    Navigator.pushNamed(context, '/auth');
+                  },
+                  child: const Text("SIGN IN"),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildQueueList() {
     return Center(
       child: Container(
-        width: 600,
+        width: math.min(600.0, MediaQuery.of(context).size.width - 32),
         padding: const EdgeInsets.all(30),
         decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(30), border: Border.all(color: Colors.white12)),
         child: Column(
@@ -127,6 +192,11 @@ class _JoinOverlayState extends State<JoinOverlay> {
             const SizedBox(height: 15),
             Text("Waiting Patients", style: GoogleFonts.plusJakartaSans(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
             const SizedBox(height: 30),
+            if (_joinError != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: Text(_joinError!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w600)),
+              ),
             Expanded(
               child: StreamBuilder<QuerySnapshot>(
                 stream: _signaling.getRoomsStream(),
@@ -134,7 +204,13 @@ class _JoinOverlayState extends State<JoinOverlay> {
                   if (!snapshot.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFF2D7D46)));
                   var queue = snapshot.data!.docs.where((doc) {
                     var data = doc.data() as Map<String, dynamic>;
-                    return data['offer'] != null && data['answer'] == null;
+                    if (data['offer'] == null || data['answer'] != null) return false;
+                    // hide ghost rooms left behind by patients who closed the tab
+                    final ts = data['createdAt'];
+                    if (ts is Timestamp && DateTime.now().difference(ts.toDate()) > const Duration(minutes: 15)) {
+                      return false;
+                    }
+                    return true;
                   }).toList();
                   
                   if (queue.isEmpty) return const Center(child: Text("No patients waiting", style: TextStyle(color: Colors.white38)));
@@ -168,30 +244,41 @@ class _JoinOverlayState extends State<JoinOverlay> {
 
   Future<void> _joinRoom(String roomId) async {
     if (_processingRoomId != null) return; // PREVENT DOUBLE CLICK
-    
+
     setState(() {
-      _processingRoomId = roomId; // Track the specific room being processed
+      _processingRoomId = roomId;
       _localMediaError = null;
+      _joinError = null;
     });
 
     try {
-      await _signaling.openUserMedia(_localRenderer, _remoteRenderer);
-      await _signaling.joinRoom(roomId, _remoteRenderer);
-      setState(() => _isJoined = true);
-    } catch (e) {
-      setState(() {
+      // Camera/mic problems are not fatal for a doctor: continue receive-only.
+      try {
+        await _signaling.openUserMedia(_localRenderer, _remoteRenderer);
+      } catch (e) {
         _localMediaError = e.toString();
-        // Try joining anyway (Receive Only mode)
-        _signaling.joinRoom(roomId, _remoteRenderer);
-        _isJoined = true;
-      });
+      }
+
+      await _signaling.joinRoom(roomId, _remoteRenderer);
+      if (mounted) setState(() => _isJoined = true);
+    } on StateError catch (e) {
+      // e.g. patient left / another doctor was faster
+      _localRenderer.srcObject = null;
+      if (mounted) setState(() { _joinError = e.message; _localMediaError = null; });
+    } catch (e) {
+      _localRenderer.srcObject = null;
+      if (mounted) setState(() { _joinError = 'Could not join the call: $e'; _localMediaError = null; });
     } finally {
-      if (mounted) setState(() => _processingRoomId = null); // Reset after joining
+      if (mounted) setState(() => _processingRoomId = null);
     }
   }
 
   Widget _buildCallUI() {
     bool hasRemoteVideo = _remoteRenderer.srcObject != null && _remoteRenderer.srcObject!.getVideoTracks().isNotEmpty;
+    final bool compact = MediaQuery.of(context).size.width < 600;
+    final double previewW = compact ? 110.0 : 180.0;
+    final double previewH = compact ? 160.0 : 260.0;
+    final double gap = compact ? 14.0 : 25.0;
 
     return Stack(
       children: [
@@ -230,11 +317,11 @@ class _JoinOverlayState extends State<JoinOverlay> {
           ),
 
         // Local Preview (Floating) - NOW HIDES WHEN CAMERA IS OFF
-        if (_isCameraOn)
+        if (_isCameraOn && !(compact && _showPrescriptionPad))
           Positioned(
-            right: 30, top: 30,
+            right: compact ? 12 : 30, top: compact ? 12 : 30,
             child: Container(
-              width: 180, height: 260,
+              width: previewW, height: previewH,
               decoration: BoxDecoration(borderRadius: BorderRadius.circular(20), border: Border.all(color: Colors.white24, width: 2)),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(18),
@@ -259,7 +346,7 @@ class _JoinOverlayState extends State<JoinOverlay> {
                   setState(() => _showPrescriptionPad = !_showPrescriptionPad);
                 }
               ),
-              const SizedBox(width: 25),
+              SizedBox(width: gap),
               _circleBtn(
                 icon: _isMicOn ? Icons.mic : Icons.mic_off, 
                 bgColor: _isMicOn ? Colors.white10 : Colors.white, 
@@ -269,7 +356,7 @@ class _JoinOverlayState extends State<JoinOverlay> {
                   setState(() => _isMicOn = !_isMicOn);
                 }
               ),
-              const SizedBox(width: 25),
+              SizedBox(width: gap),
               _circleBtn(
                 icon: Icons.call_end, bgColor: Colors.red, iconColor: Colors.white,
                 onTap: () {
@@ -277,7 +364,7 @@ class _JoinOverlayState extends State<JoinOverlay> {
                   Navigator.pop(context);
                 }
               ),
-              const SizedBox(width: 25),
+              SizedBox(width: gap),
               _circleBtn(
                 icon: _isCameraOn ? Icons.videocam : Icons.videocam_off, 
                 bgColor: _isCameraOn ? Colors.white10 : Colors.white, 
@@ -295,12 +382,13 @@ class _JoinOverlayState extends State<JoinOverlay> {
   }
 
   Widget _circleBtn({required IconData icon, required Color bgColor, required Color iconColor, VoidCallback? onTap}) {
+    final bool compact = MediaQuery.of(context).size.width < 600;
     return InkWell(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.all(18),
+        padding: EdgeInsets.all(compact ? 14 : 18),
         decoration: BoxDecoration(color: bgColor, shape: BoxShape.circle),
-        child: Icon(icon, color: iconColor, size: 30),
+        child: Icon(icon, color: iconColor, size: compact ? 26 : 30),
       ),
     );
   }

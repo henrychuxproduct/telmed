@@ -9,7 +9,14 @@ import 'package:telmed/pages/home_page.dart';
 import 'package:telmed/pages/patient_prescription_dashboard.dart'; 
 
 class CallOverlay extends StatefulWidget {
-  const CallOverlay({super.key});
+  /// True only when the M-Pesa payment was confirmed (see TelmedHomePage).
+  /// Without it the overlay refuses to start a call.
+  final bool paymentVerified;
+
+  /// The M-Pesa checkoutRequestID, stored on the room for reconciliation.
+  final String? paymentId;
+
+  const CallOverlay({super.key, this.paymentVerified = false, this.paymentId});
 
   @override
   State<CallOverlay> createState() => _CallOverlayState();
@@ -38,6 +45,7 @@ class _CallOverlayState extends State<CallOverlay> {
   String? _localMediaError; 
   String _connectionStatus = "Initializing"; 
   String? _roomId;
+  bool _leaving = false;
 
   @override
   void initState() {
@@ -45,18 +53,36 @@ class _CallOverlayState extends State<CallOverlay> {
     _initRenderers();
 
     // --- LISTEN FOR HANGUP ---
-    _signaling.onCallEnded = () {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("The call has ended"), backgroundColor: Colors.red),
-        );
-        _signaling.hangUp(_localRenderer); 
-        Navigator.pushAndRemoveUntil(
-          context,
-          MaterialPageRoute(builder: (context) => const TelmedHomePage()),
-          (Route<dynamic> route) => false,
-        );
-      }
+    _signaling.onCallEnded = () async {
+      if (!mounted || _leaving) return;
+      _leaving = true;
+
+      final String? rid = _roomId;
+      Map<String, dynamic>? rx;
+      if (rid != null) rx = await _prescriptionService.getPrescription(rid);
+      if (!mounted) return;
+
+      _signaling.hangUp(_localRenderer, roomId: rid);
+
+      // If the doctor already issued a prescription, don't throw the patient
+      // back to the home page and lose it - take them straight to it.
+      final bool hasRx = rid != null && rx != null && rx['status'] == 'issued';
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(hasRx ? "The call has ended. Your prescription is ready." : "The call has ended"),
+          backgroundColor: hasRx ? const Color(0xFF2D7D46) : Colors.red,
+        ),
+      );
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(
+          builder: (context) => hasRx
+              ? PatientPrescriptionDashboard(roomId: rid)
+              : const TelmedHomePage(),
+        ),
+        (Route<dynamic> route) => false,
+      );
     };
   }
 
@@ -104,7 +130,11 @@ class _CallOverlayState extends State<CallOverlay> {
     super.dispose();
   }
 
-  Future<void> _validateAndProcessPayment() async {
+  /// Called from the button on the card. Payment was ALREADY verified on the
+  /// home page (M-Pesa), so this only asks for camera/mic and starts the call.
+  Future<void> _startConsultation() async {
+    if (!widget.paymentVerified) return; // never start a call without payment
+
     setState(() {
       _isPaying = true;
       _localMediaError = null;
@@ -112,33 +142,26 @@ class _CallOverlayState extends State<CallOverlay> {
 
     try {
       await _signaling.openUserMedia(_localRenderer, _remoteRenderer);
-      
-      if (mounted) {
-        setState(() => _hasPermissions = true);
-      }
+      if (!mounted) return;
 
-      await Future.delayed(const Duration(seconds: 3));
-
-      if (mounted) {
-        setState(() {
-          _isPaying = false;
-          _paymentConfirmed = true;
-        });
-        _startWebRTCCall();
-      }
-
+      setState(() {
+        _hasPermissions = true;
+        _isPaying = false;
+        _paymentConfirmed = true;
+      });
+      _startWebRTCCall();
     } catch (e) {
       debugPrint("Permission Error: $e");
       if (mounted) {
         setState(() {
           _isPaying = false;
-          String errorStr = e.toString();
+          final String errorStr = e.toString();
           if (errorStr.contains('NotFoundError')) {
-             _localMediaError = "Hardware Missing: No Camera/Mic found.";
+            _localMediaError = "Hardware Missing: No Camera/Mic found.";
           } else if (errorStr.contains('NotAllowedError') || errorStr.contains('PermissionDeniedError')) {
-             _localMediaError = "Permission Denied: Click lock icon 🔒 to allow.";
+            _localMediaError = "Permission Denied: Click lock icon 🔒 to allow.";
           } else {
-             _localMediaError = "Media Error: $e";
+            _localMediaError = "Media Error: $e";
           }
         });
       }
@@ -148,7 +171,7 @@ class _CallOverlayState extends State<CallOverlay> {
   Future<void> _startWebRTCCall() async {
     setState(() => _callConnecting = true);
     try {
-      _roomId = await _signaling.createRoom(_remoteRenderer);
+      _roomId = await _signaling.createRoom(_remoteRenderer, paymentId: widget.paymentId);
       if (mounted) setState(() => _callConnecting = false);
     } catch (e) {
       debugPrint("Call failed: $e");
@@ -454,53 +477,75 @@ class _CallOverlayState extends State<CallOverlay> {
   }
 
   Widget _buildPaymentUI() {
+    final bool verified = widget.paymentVerified;
+    final bool compact = MediaQuery.of(context).size.width < 420;
+
     return Center(
-      child: Container(
-        width: 380,
-        padding: const EdgeInsets.all(40),
-        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(30)),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.security_rounded, size: 60, color: Color(0xFF2D7D46)),
-            const SizedBox(height: 20),
-            Text("KSH 54", style: GoogleFonts.plusJakartaSans(fontSize: 48, fontWeight: FontWeight.w900, color: const Color(0xFF1B4D2C))),
-            const SizedBox(height: 30),
-            if (_localMediaError != null)
-              Container(
-                margin: const EdgeInsets.only(bottom: 20),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.red.shade200)),
-                child: Row(
-                  children: [
-                    const Icon(Icons.error_outline, color: Colors.red),
-                    const SizedBox(width: 10),
-                    Expanded(child: Text(_localMediaError!, style: const TextStyle(color: Colors.red, fontSize: 13))),
-                  ],
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 380),
+          child: Container(
+            padding: EdgeInsets.all(compact ? 24 : 40),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(30)),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(verified ? Icons.verified_rounded : Icons.lock_outline, size: 60, color: const Color(0xFF2D7D46)),
+                const SizedBox(height: 20),
+                Text("KSH 54", style: GoogleFonts.plusJakartaSans(fontSize: compact ? 40 : 48, fontWeight: FontWeight.w900, color: const Color(0xFF1B4D2C))),
+                const SizedBox(height: 8),
+                Text(
+                  verified ? "Payment received" : "Payment required",
+                  style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w700, color: verified ? const Color(0xFF2D7D46) : Colors.black54),
                 ),
-              ),
-            ElevatedButton(
-              onPressed: _isPaying ? null : _validateAndProcessPayment,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _localMediaError != null ? Colors.redAccent : const Color(0xFFF9A825),
-                minimumSize: const Size(double.infinity, 65),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-              ),
-              child: _isPaying
-                  ? const CircularProgressIndicator(color: Colors.white)
-                  : Text(_localMediaError != null ? "RETRY ACCESS" : "PAY & CONNECT", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
+                if (!verified) ...[
+                  const SizedBox(height: 12),
+                  const Text(
+                    "Please start from 'Call Telmed' on the home page so your M-Pesa payment can be verified.",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.black54, height: 1.4),
+                  ),
+                ],
+                const SizedBox(height: 30),
+                if (_localMediaError != null)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 20),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.red.shade200)),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.error_outline, color: Colors.red),
+                        const SizedBox(width: 10),
+                        Expanded(child: Text(_localMediaError!, style: const TextStyle(color: Colors.red, fontSize: 13))),
+                      ],
+                    ),
+                  ),
+                ElevatedButton(
+                  onPressed: (_isPaying || !verified) ? null : _startConsultation,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _localMediaError != null ? Colors.redAccent : const Color(0xFFF9A825),
+                    minimumSize: const Size(double.infinity, 65),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                  ),
+                  child: _isPaying
+                      ? const CircularProgressIndicator(color: Colors.white)
+                      : Text(_localMediaError != null ? "RETRY ACCESS" : "START CONSULTATION", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildLocalThumbnail() {
+    final bool compact = MediaQuery.of(context).size.width < 420;
     return Positioned(
-      bottom: 140, right: 25,
+      bottom: compact ? 120 : 140, right: compact ? 12 : 25,
       child: Container(
-        width: 120, height: 180,
+        width: compact ? 96 : 120, height: compact ? 144 : 180,
         decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20), border: Border.all(color: Colors.white38, width: 2)),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(18),
@@ -513,6 +558,7 @@ class _CallOverlayState extends State<CallOverlay> {
   }
 
   Widget _buildActionControls() {
+    final double gap = MediaQuery.of(context).size.width < 420 ? 14 : 25;
     return Positioned(
       bottom: 40, left: 0, right: 0,
       child: Row(
@@ -526,7 +572,7 @@ class _CallOverlayState extends State<CallOverlay> {
               setState(() => _showPrescription = !_showPrescription);
             }
           ),
-          const SizedBox(width: 25),
+          SizedBox(width: gap),
           _circleBtn(
             icon: _isMicOn ? Icons.mic : Icons.mic_off, 
             bgColor: _isMicOn ? Colors.white10 : Colors.white, 
@@ -536,7 +582,7 @@ class _CallOverlayState extends State<CallOverlay> {
               setState(() => _isMicOn = !_isMicOn);
             }
           ),
-          const SizedBox(width: 25),
+          SizedBox(width: gap),
           _circleBtn(
             icon: Icons.call_end, bgColor: Colors.red, iconColor: Colors.white,
             onTap: () {
@@ -551,7 +597,7 @@ class _CallOverlayState extends State<CallOverlay> {
               );
             }
           ),
-          const SizedBox(width: 25),
+          SizedBox(width: gap),
           _circleBtn(
             icon: _isCameraOn ? Icons.videocam : Icons.videocam_off, 
             bgColor: _isCameraOn ? Colors.white10 : Colors.white, 
@@ -567,12 +613,13 @@ class _CallOverlayState extends State<CallOverlay> {
   }
 
   Widget _circleBtn({required IconData icon, required Color bgColor, required Color iconColor, VoidCallback? onTap}) {
+    final bool compact = MediaQuery.of(context).size.width < 420;
     return InkWell(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.all(18),
+        padding: EdgeInsets.all(compact ? 14 : 18),
         decoration: BoxDecoration(color: bgColor, shape: BoxShape.circle),
-        child: Icon(icon, color: iconColor, size: 30),
+        child: Icon(icon, color: iconColor, size: compact ? 26 : 30),
       ),
     );
   }

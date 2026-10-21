@@ -1,151 +1,237 @@
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 typedef StreamHandler = void Function(MediaStream stream);
 typedef ConnectionHandler = void Function(RTCPeerConnectionState state);
-typedef VoidCallback = void Function();
+// NOTE: the old `typedef VoidCallback` was removed. It clashed with Flutter's
+// own VoidCallback in every file that imported both (ambiguous import).
 
 class Signaling {
-  Map<String, dynamic> configuration = {
-    'iceServers': [
-      {'urls': ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302']}
-    ]
-  };
+  // Optional TURN server, passed at build time:
+  //   --dart-define=TURN_URL=turn:your.server:3478
+  //   --dart-define=TURN_USER=xxx --dart-define=TURN_PASS=yyy
+  // STUN alone cannot connect many mobile-data / corporate networks (CGNAT /
+  // symmetric NAT). Those calls show "connected" signalling but NO video.
+  static const String _turnUrl = String.fromEnvironment('TURN_URL');
+  static const String _turnUser = String.fromEnvironment('TURN_USER');
+  static const String _turnPass = String.fromEnvironment('TURN_PASS');
+
+  Map<String, dynamic> get configuration => {
+        'iceServers': [
+          {
+            'urls': [
+              'stun:stun1.l.google.com:19302',
+              'stun:stun2.l.google.com:19302',
+            ]
+          },
+          if (_turnUrl.isNotEmpty)
+            {
+              'urls': [_turnUrl],
+              'username': _turnUser,
+              'credential': _turnPass,
+            },
+        ]
+      };
 
   RTCPeerConnection? peerConnection;
   MediaStream? localStream;
   MediaStream? remoteStream;
-  String? roomId; // Class-level roomId
-  
+  String? roomId;
+
   StreamHandler? onAddRemoteStream;
   ConnectionHandler? onConnectionState;
-  VoidCallback? onCallEnded;
-  VoidCallback? onCallAccepted; // NEW: Callback for immediate UI updates
+  void Function()? onCallEnded;
+  void Function()? onCallAccepted;
 
-  List<RTCIceCandidate> _candidateQueue = [];
+  final List<RTCIceCandidate> _candidateQueue = [];
+  final List<StreamSubscription<dynamic>> _subs = [];
   bool _isRemoteDescriptionSet = false;
+  bool _answerApplied = false;
+  bool _endedNotified = false;
 
   Stream<QuerySnapshot> getRoomsStream() {
     return FirebaseFirestore.instance.collection('rooms').snapshots();
   }
 
+  void _cancelSubs() {
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _subs.clear();
+  }
+
+  void _notifyEnded() {
+    if (_endedNotified) return; // fire once, not on every snapshot
+    _endedNotified = true;
+    onCallEnded?.call();
+  }
+
   // --- 1. CALLER (Patient) ---
-  Future<String> createRoom(RTCVideoRenderer remoteRenderer) async {
-    FirebaseFirestore db = FirebaseFirestore.instance;
-    DocumentReference roomRef = db.collection('rooms').doc();
+  Future<String> createRoom(
+    RTCVideoRenderer remoteRenderer, {
+    String? paymentId,
+  }) async {
+    final FirebaseFirestore db = FirebaseFirestore.instance;
+    final DocumentReference roomRef = db.collection('rooms').doc();
+
+    _endedNotified = false;
+    _answerApplied = false;
 
     peerConnection = await createPeerConnection(configuration);
     registerPeerConnectionListeners();
 
     if (localStream != null) {
-      localStream!.getTracks().forEach((track) {
+      for (final track in localStream!.getTracks()) {
         peerConnection?.addTrack(track, localStream!);
-      });
+      }
     }
 
-    var callerCandidatesCollection = roomRef.collection('callerCandidates');
+    final callerCandidates = roomRef.collection('callerCandidates');
     peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
-      callerCandidatesCollection.add(candidate.toMap());
+      callerCandidates.add(candidate.toMap());
     };
 
-    RTCSessionDescription offer = await peerConnection!.createOffer();
+    final RTCSessionDescription offer = await peerConnection!.createOffer();
     await peerConnection!.setLocalDescription(offer);
 
-    Map<String, dynamic> roomWithOffer = {'offer': offer.toMap()};
-    await roomRef.set(roomWithOffer);
-    
-    roomId = roomRef.id; // Store in class variable
+    await roomRef.set({
+      'offer': offer.toMap(),
+      'createdAt': FieldValue.serverTimestamp(),
+      if (paymentId != null) 'paymentId': paymentId,
+    });
 
-    roomRef.snapshots().listen((snapshot) async {
+    roomId = roomRef.id;
+
+    _subs.add(roomRef.snapshots().listen((snapshot) async {
       if (!snapshot.exists) {
-        if (onCallEnded != null) onCallEnded!();
+        _notifyEnded();
         return;
       }
 
       final data = snapshot.data() as Map<String, dynamic>?;
-      // GUARD CLAUSE: Only set answer if we are actually waiting for one
-      bool isWaitingForAnswer = peerConnection?.signalingState == RTCSignalingState.RTCSignalingStateHaveLocalOffer;
-      
-      if (isWaitingForAnswer && data != null && data['answer'] != null) {
-        // NEW: Immediately notify UI that the doctor accepted the call
-        if (onCallAccepted != null) onCallAccepted!();
+      final bool isWaitingForAnswer = peerConnection?.signalingState ==
+          RTCSignalingState.RTCSignalingStateHaveLocalOffer;
 
-        var answer = RTCSessionDescription(data['answer']['sdp'], data['answer']['type']);
+      if (isWaitingForAnswer &&
+          !_answerApplied &&
+          data != null &&
+          data['answer'] != null) {
+        _answerApplied = true; // snapshots can fire again while we await
+        onCallAccepted?.call();
+
+        final answer = RTCSessionDescription(
+          data['answer']['sdp'],
+          data['answer']['type'],
+        );
         await peerConnection?.setRemoteDescription(answer);
         _isRemoteDescriptionSet = true;
         _processCandidateQueue();
       }
-    });
+    }));
 
-    roomRef.collection('calleeCandidates').snapshots().listen((snapshot) {
-      for (var change in snapshot.docChanges) {
+    _subs.add(roomRef.collection('calleeCandidates').snapshots().listen((snapshot) {
+      for (final change in snapshot.docChanges) {
         if (change.type == DocumentChangeType.added) {
-          Map<String, dynamic> data = change.doc.data() as Map<String, dynamic>;
-          var candidate = RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']);
-          _addCandidate(candidate);
+          final data = change.doc.data() as Map<String, dynamic>;
+          _addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
         }
       }
-    });
+    }));
 
     return roomId!;
   }
 
   // --- 2. JOINER (Doctor) ---
+  /// Throws a [StateError] with a user-friendly message if the patient is gone
+  /// or another doctor already accepted. Nothing is deleted in that case.
   Future<void> joinRoom(String incomingRoomId, RTCVideoRenderer remoteVideo) async {
-    roomId = incomingRoomId; // Store in class variable so Doctor can also hang up effectively
-    FirebaseFirestore db = FirebaseFirestore.instance;
-    DocumentReference roomRef = db.collection('rooms').doc(roomId);
-    var roomSnapshot = await roomRef.get();
+    final FirebaseFirestore db = FirebaseFirestore.instance;
+    final DocumentReference roomRef = db.collection('rooms').doc(incomingRoomId);
 
-    if (roomSnapshot.exists) {
+    final roomSnapshot = await roomRef.get();
+    if (!roomSnapshot.exists) {
+      throw StateError('This patient is no longer waiting.');
+    }
+    final roomData = roomSnapshot.data() as Map<String, dynamic>;
+    if (roomData['answer'] != null) {
+      throw StateError('Another doctor has already accepted this patient.');
+    }
+
+    _endedNotified = false;
+    _answerApplied = false;
+
+    try {
       peerConnection = await createPeerConnection(configuration);
       registerPeerConnectionListeners();
 
       if (localStream != null) {
-        localStream!.getTracks().forEach((track) {
+        for (final track in localStream!.getTracks()) {
           peerConnection?.addTrack(track, localStream!);
-        });
+        }
       }
 
-      var calleeCandidatesCollection = roomRef.collection('calleeCandidates');
+      final calleeCandidates = roomRef.collection('calleeCandidates');
       peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
-        calleeCandidatesCollection.add(candidate.toMap());
+        calleeCandidates.add(candidate.toMap());
       };
 
-      roomRef.snapshots().listen((snapshot) {
-         if (!snapshot.exists) {
-           if (onCallEnded != null) onCallEnded!();
-         }
-      });
+      final offer = roomData['offer'];
+      await peerConnection!.setRemoteDescription(
+        RTCSessionDescription(offer['sdp'], offer['type']),
+      );
+      _isRemoteDescriptionSet = true;
 
-      var data = roomSnapshot.data() as Map<String, dynamic>;
-      
-      // GUARD: Check if we are already connected to avoid "stable" state errors
-      if (peerConnection?.signalingState != RTCSignalingState.RTCSignalingStateStable) {
-        var offer = data['offer'];
-        await peerConnection?.setRemoteDescription(
-          RTCSessionDescription(offer['sdp'], offer['type']),
-        );
-        _isRemoteDescriptionSet = true;
-        _processCandidateQueue();
+      final answer = await peerConnection!.createAnswer();
+      await peerConnection!.setLocalDescription(answer);
 
-        var answer = await peerConnection!.createAnswer();
-        await peerConnection!.setLocalDescription(answer);
-
-        Map<String, dynamic> roomWithAnswer = {
-          'answer': {'type': answer.type, 'sdp': answer.sdp}
-        };
-        await roomRef.update(roomWithAnswer);
-      }
-
-      roomRef.collection('callerCandidates').snapshots().listen((snapshot) {
-        for (var document in snapshot.docChanges) {
-          var data = document.doc.data() as Map<String, dynamic>;
-          var candidate = RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']);
-          _addCandidate(candidate);
+      // Atomic claim: if two doctors tap ACCEPT together, only one wins.
+      await db.runTransaction((tx) async {
+        final snap = await tx.get(roomRef);
+        if (!snap.exists) {
+          throw StateError('This patient is no longer waiting.');
         }
+        final d = snap.data() as Map<String, dynamic>?;
+        if (d != null && d['answer'] != null) {
+          throw StateError('Another doctor has already accepted this patient.');
+        }
+        tx.update(roomRef, {
+          'answer': {'type': answer.type, 'sdp': answer.sdp},
+          'answeredAt': FieldValue.serverTimestamp(),
+        });
       });
+
+      // Only now do we "own" the room (so hangUp may delete it).
+      roomId = incomingRoomId;
+
+      _subs.add(roomRef.snapshots().listen((snapshot) {
+        if (!snapshot.exists) _notifyEnded();
+      }));
+
+      _subs.add(roomRef.collection('callerCandidates').snapshots().listen((snapshot) {
+        for (final change in snapshot.docChanges) {
+          // ignore 'removed' events fired when the patient cleans up
+          if (change.type != DocumentChangeType.added) continue;
+          final data = change.doc.data() as Map<String, dynamic>;
+          _addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
+        }
+      }));
+
+      _processCandidateQueue();
+    } catch (e) {
+      // Roll back locally WITHOUT touching the room document.
+      roomId = null;
+      await _stopMediaAndPeer(null);
+      rethrow;
     }
   }
 
@@ -158,111 +244,127 @@ class Signaling {
   }
 
   void _processCandidateQueue() {
-    for (var candidate in _candidateQueue) {
+    for (final candidate in _candidateQueue) {
       peerConnection?.addCandidate(candidate);
     }
     _candidateQueue.clear();
   }
 
-  Future<void> openUserMedia(RTCVideoRenderer localVideo, RTCVideoRenderer remoteVideo) async {
+  /// Throws if the camera/mic can't be opened (permission denied, no device…)
+  /// so the UI can show a real message. Previously the error was swallowed,
+  /// which is why "Permission denied" never appeared in the UI.
+  Future<void> openUserMedia(
+    RTCVideoRenderer localVideo,
+    RTCVideoRenderer remoteVideo,
+  ) async {
     final Map<String, dynamic> mediaConstraints = {
       'audio': true,
-      'video': {'facingMode': 'user', 'width': 1280, 'height': 720}
+      'video': {'facingMode': 'user', 'width': 1280, 'height': 720},
     };
 
     try {
-      var stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+      final stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
       localVideo.srcObject = stream;
       localStream = stream;
     } catch (e) {
-      print("Signaling: Error opening user media: $e");
-      // Allow proceeding even without local media (Receive only)
+      debugPrint('Signaling: Error opening user media: $e');
+      rethrow;
     }
   }
 
   void toggleMic() {
     if (localStream != null && localStream!.getAudioTracks().isNotEmpty) {
-      bool enabled = localStream!.getAudioTracks()[0].enabled;
-      localStream!.getAudioTracks()[0].enabled = !enabled;
+      final track = localStream!.getAudioTracks()[0];
+      track.enabled = !track.enabled;
     }
   }
 
   void toggleCamera() {
     if (localStream != null && localStream!.getVideoTracks().isNotEmpty) {
-      bool enabled = localStream!.getVideoTracks()[0].enabled;
-      localStream!.getVideoTracks()[0].enabled = !enabled;
+      final track = localStream!.getVideoTracks()[0];
+      track.enabled = !track.enabled;
     }
   }
 
-  Future<void> hangUp(RTCVideoRenderer localVideo, {String? roomId}) async {
-    // 1. Database Cleanup First: Ensure UI updates immediately
-    String? targetRoomId = roomId ?? this.roomId;
+  Future<void> _stopMediaAndPeer(RTCVideoRenderer? localVideo) async {
+    _cancelSubs();
 
-    if (targetRoomId != null) {
-      try {
-        var db = FirebaseFirestore.instance;
-        var roomRef = db.collection('rooms').doc(targetRoomId);
-        
-        // Wipe subcollections first (Prevents Firestore 'ghost' documents)
-        var callerCandidates = await roomRef.collection('callerCandidates').get();
-        for (var doc in callerCandidates.docs) {
-          await doc.reference.delete();
-        }
-
-        var calleeCandidates = await roomRef.collection('calleeCandidates').get();
-        for (var doc in calleeCandidates.docs) {
-          await doc.reference.delete();
-        }
-
-        // Wipe the actual room document
-        await roomRef.delete();
-        print("Signaling: Room $targetRoomId successfully deleted from database.");
-      } catch (e) {
-        print("Signaling: Error deleting room from database: $e");
-      }
+    try {
+      localVideo?.srcObject?.getTracks().forEach((t) => t.stop());
+    } catch (e) {
+      debugPrint('Error stopping renderer tracks: $e');
+    }
+    try {
+      localStream?.getTracks().forEach((t) => t.stop());
+    } catch (e) {
+      debugPrint('Error stopping local tracks: $e');
+    }
+    try {
+      remoteStream?.getTracks().forEach((t) => t.stop());
+    } catch (e) {
+      debugPrint('Error stopping remote tracks: $e');
     }
 
-    // 2. Hardware Cleanup: Wrapped in try-catches to prevent function failures
     try {
-      if (localVideo.srcObject != null) {
-        localVideo.srcObject!.getTracks().forEach((track) => track.stop());
-      }
-      localStream?.getTracks().forEach((track) => track.stop());
-    } catch(e) { print("Error stopping local tracks: $e"); }
+      await peerConnection?.close();
+    } catch (e) {
+      debugPrint('Error closing peer connection: $e');
+    }
 
     try {
-      remoteStream?.getTracks().forEach((track) => track.stop());
-    } catch(e) { print("Error stopping remote tracks: $e"); }
+      await localStream?.dispose();
+      await remoteStream?.dispose();
+    } catch (e) {
+      debugPrint('Error disposing streams: $e');
+    }
 
-    // 3. Close the WebRTC PeerConnection safely
-    try {
-      if (peerConnection != null) {
-        await peerConnection!.close();
-      }
-    } catch(e) { print("Error closing peer connection: $e"); }
-
-    // 4. Memory Cleanup
-    localStream?.dispose();
-    remoteStream?.dispose();
     localStream = null;
     remoteStream = null;
     peerConnection = null;
-    this.roomId = null;
     _isRemoteDescriptionSet = false;
+    _answerApplied = false;
     _candidateQueue.clear();
+  }
+
+  Future<void> hangUp(RTCVideoRenderer localVideo, {String? roomId}) async {
+    final String? targetRoomId = roomId ?? this.roomId;
+    this.roomId = null;
+
+    // 1. Hardware + listeners first. Cancelling listeners BEFORE we delete the
+    //    room stops our own deletion from firing "call ended" back at us.
+    await _stopMediaAndPeer(localVideo);
+
+    // 2. Database cleanup (ghost rooms would otherwise stay in the queue).
+    if (targetRoomId != null) {
+      try {
+        final roomRef =
+            FirebaseFirestore.instance.collection('rooms').doc(targetRoomId);
+
+        for (final sub in ['callerCandidates', 'calleeCandidates']) {
+          final snap = await roomRef.collection(sub).get();
+          for (final doc in snap.docs) {
+            await doc.reference.delete();
+          }
+        }
+        await roomRef.delete();
+        debugPrint('Signaling: Room $targetRoomId deleted.');
+      } catch (e) {
+        debugPrint('Signaling: Error deleting room: $e');
+      }
+    }
   }
 
   void registerPeerConnectionListeners() {
     peerConnection?.onConnectionState = (RTCPeerConnectionState state) {
-      print('Signaling: Connection state change: $state');
-      if (onConnectionState != null) onConnectionState!(state);
+      debugPrint('Signaling: Connection state change: $state');
+      onConnectionState?.call(state);
     };
-    
+
     peerConnection?.onTrack = (RTCTrackEvent event) {
-      print('Signaling: Track received: ${event.streams.length} streams');
+      debugPrint('Signaling: Track received: ${event.streams.length} streams');
       if (event.streams.isNotEmpty) {
         remoteStream = event.streams[0];
-        if (onAddRemoteStream != null) onAddRemoteStream!(remoteStream!);
+        onAddRemoteStream?.call(remoteStream!);
       }
     };
   }

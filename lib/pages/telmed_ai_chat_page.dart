@@ -51,6 +51,17 @@ class _TelmedAiChatPageState extends State<TelmedAiChatPage> {
   bool _isTyping = false;
 
   // --- GEMINI AI STATE ---
+  // Provide at build time (do NOT hard-code keys in source):
+  //   flutter run -d chrome --dart-define=GEMINI_API_KEY=xxxx
+  // NOTE: on Flutter web any key in the bundle is readable by visitors, so
+  // for production route requests through your backend (e.g. the Vercel API)
+  // or Firebase AI Logic instead.
+  static const String _geminiKey = String.fromEnvironment('GEMINI_API_KEY');
+  // gemini-1.5-flash has been shut down by Google. Check
+  // https://ai.google.dev/gemini-api/docs/models for the current model name.
+  static const String _geminiModel =
+      String.fromEnvironment('GEMINI_MODEL', defaultValue: 'gemini-2.5-flash');
+
   late final GenerativeModel _model;
   late final ChatSession _chatSession;
 
@@ -61,10 +72,10 @@ class _TelmedAiChatPageState extends State<TelmedAiChatPage> {
   }
 
   void _initializeGemini() {
-    // Initializes the Flash model with the hardcoded API Key
+    // Initializes the Flash model (key + model come from --dart-define)
     _model = GenerativeModel(
-      model: 'gemini-1.5-flash',
-      apiKey: 'AIzaSyCYUwg43Xbe3wYgDO6edsmb8jdPzw05jKM', 
+      model: _geminiModel,
+      apiKey: _geminiKey,
       systemInstruction: Content.system(
         'You are the Telmed Assistant, a secure and professional virtual healthcare assistant. '
         'You help patients understand lab results, review uploaded medical documents, and answer health queries. '
@@ -172,11 +183,14 @@ class _TelmedAiChatPageState extends State<TelmedAiChatPage> {
         _scrollToBottom();
       }
     } catch (e) {
+      debugPrint('Gemini error: $e');
       if (mounted) {
         setState(() {
           _isTyping = false;
           _messages.insert(0, ChatMessage(
-            text: "I encountered a network error. Please check your connection or API key and try again.",
+            text: _geminiKey.isEmpty
+                ? "The AI assistant isn't configured yet (missing API key)."
+                : "I couldn't reach the AI service right now. Please try again in a moment.",
             isUser: false,
             timestamp: DateTime.now(),
           ));

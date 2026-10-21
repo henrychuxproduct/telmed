@@ -67,7 +67,10 @@ class AuthService {
           'name': name,
           'role': role, // 'patient', 'doctor', or 'pharmacy'
           'createdAt': FieldValue.serverTimestamp(),
-          'isActive': true, 
+          'isActive': true,
+          // Doctors / pharmacies must be approved by an admin before they can
+          // use the doctor portal. (Set isVerified: true in the Firestore console.)
+          'isVerified': role == 'patient',
         };
 
         // 3. Sync to Firestore using merge to prevent destructive overwrites
@@ -139,6 +142,34 @@ class AuthService {
     } catch (e) {
       debugPrint("AuthService: Error fetching user role: $e");
       return null;
+    }
+  }
+
+  /// FETCH FULL PROFILE: role, isVerified, name...
+  Future<Map<String, dynamic>?> getUserProfile(String uid) async {
+    try {
+      final DocumentSnapshot doc = await _db.collection('users').doc(uid).get();
+      if (doc.exists) return doc.data() as Map<String, dynamic>?;
+      return null;
+    } catch (e) {
+      debugPrint("AuthService: Error fetching profile: $e");
+      return null;
+    }
+  }
+
+  /// PASSWORD RESET: returns null on success (also when the email is unknown,
+  /// so we don't reveal which emails have accounts).
+  Future<String?> sendPasswordReset(String email) async {
+    try {
+      await _auth.sendPasswordResetEmail(email: email);
+      return null;
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'user-not-found') return null;
+      if (e.code == 'invalid-email') return 'The email address is not valid.';
+      return _handleFirebaseAuthError(e);
+    } catch (e) {
+      debugPrint("AuthService: Error sending reset email: $e");
+      return "An unexpected error occurred. Please try again.";
     }
   }
 

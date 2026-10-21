@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
+import '../utils/responsive.dart';
 import '../widgets/common_widget.dart';
 import '../services/mpesa_service.dart';
 import '../widgets/call_overlay.dart'; 
@@ -24,7 +26,7 @@ class _TelmedHomePageState extends State<TelmedHomePage>
   late Animation<double> _heroOpacity;
   late Animation<Offset> _heroSlide;
 
-  double _navOpacity = 0.0;
+  final ValueNotifier<double> _navOpacity = ValueNotifier<double>(0.0);
 
   final MpesaService _mpesaService = MpesaService();
   final TextEditingController _phoneController = TextEditingController();
@@ -34,11 +36,8 @@ class _TelmedHomePageState extends State<TelmedHomePage>
     super.initState();
     _scrollController = ScrollController()
       ..addListener(() {
-        if (mounted) {
-          setState(() {
-            _navOpacity = (_scrollController.offset / 400).clamp(0.0, 1.0);
-          });
-        }
+        _navOpacity.value =
+            (_scrollController.offset / 400).clamp(0.0, 1.0).toDouble();
       });
 
     _heroTextController = AnimationController(
@@ -72,6 +71,7 @@ class _TelmedHomePageState extends State<TelmedHomePage>
   @override
   void dispose() {
     _scrollController.dispose();
+    _navOpacity.dispose();
     _heroTextController.dispose();
     _phoneController.dispose();
     super.dispose();
@@ -184,65 +184,86 @@ class _TelmedHomePageState extends State<TelmedHomePage>
       );
     }
 
-    final String? checkoutRequestId = await _mpesaService.initiatePayment(
-      phoneNumber: phoneNumber,
-      amount: 54, 
-    );
-
-    if (checkoutRequestId == null) {
-      if (mounted) {
-        Navigator.pop(context); 
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            backgroundColor: Colors.redAccent,
-            content: Text(
-              "Failed to initiate M-Pesa connection. Please try again.",
-            ),
-          ),
-        );
-      }
+    final String checkoutRequestId;
+    try {
+      checkoutRequestId = await _mpesaService.initiatePayment(
+        phoneNumber: phoneNumber,
+        amount: 54,
+      );
+    } on MpesaException catch (e) {
+      if (!mounted) return;
+      Navigator.pop(context); // close the loading spinner
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: Colors.redAccent,
+          duration: const Duration(seconds: 6),
+          content: Text(e.message),
+        ),
+      );
       return;
     }
 
-    _mpesaService
-        .listenToPaymentStatus(checkoutRequestId)
-        .listen((DocumentSnapshot snapshot) {
-      if (snapshot.exists) {
+    // One subscription per payment, always cancelled when we're done, so a
+    // late/duplicate Firestore update can't pop pages or push a 2nd call.
+    StreamSubscription<DocumentSnapshot>? sub;
+    Timer? timeout;
+    bool handled = false;
+
+    void finish() {
+      handled = true;
+      sub?.cancel();
+      timeout?.cancel();
+    }
+
+    void fail(String message) {
+      if (handled || !mounted) return;
+      finish();
+      Navigator.pop(context); // close the loading spinner
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(backgroundColor: Colors.redAccent, content: Text(message)),
+      );
+    }
+
+    // Don't leave the user on an un-dismissable spinner forever.
+    timeout = Timer(const Duration(seconds: 90), () {
+      fail("No payment confirmation received. If money was deducted, please contact support.");
+    });
+
+    sub = _mpesaService.listenToPaymentStatus(checkoutRequestId).listen(
+      (DocumentSnapshot snapshot) {
+        if (handled || !mounted || !snapshot.exists) return;
         final data = snapshot.data() as Map<String, dynamic>?;
         final String? status = data?['status'];
 
         if (status == 'completed') {
-          if (mounted) {
-            Navigator.pop(context); 
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                backgroundColor: Color(0xFF2D7D46),
-                content: Text(
-                  "Payment Verified! Initializing secure medical line...",
-                ),
+          finish();
+          Navigator.pop(context); // close the loading spinner
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              backgroundColor: Color(0xFF2D7D46),
+              content: Text(
+                "Payment Verified! Initializing secure medical line...",
               ),
-            );
-            
-            Navigator.push(
-              context,
-              MaterialPageRoute(builder: (context) => const CallOverlay()),
-            );
-          }
+            ),
+          );
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => CallOverlay(
+                paymentVerified: true,
+                paymentId: checkoutRequestId,
+              ),
+            ),
+          );
         } else if (status == 'failed') {
-          if (mounted) {
-            Navigator.pop(context); 
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                backgroundColor: Colors.redAccent,
-                content: Text(
-                  "Transaction failed or was cancelled by the user.",
-                ),
-              ),
-            );
-          }
+          fail("Transaction failed or was cancelled by the user.");
         }
-      }
-    });
+      },
+      onError: (Object e) {
+        // e.g. Firestore "permission-denied" – previously this was unhandled.
+        fail("Could not read payment status: $e");
+      },
+    );
   }
 
   @override
@@ -253,7 +274,11 @@ class _TelmedHomePageState extends State<TelmedHomePage>
       body: Stack(
         children: [
           _buildMainScrollArea(),
-          TelmedNavBar(navOpacity: _navOpacity), 
+          ValueListenableBuilder<double>(
+            valueListenable: _navOpacity,
+            builder: (BuildContext context, double opacity, Widget? _) =>
+                TelmedNavBar(navOpacity: opacity),
+          ),
         ],
       ),
     );
@@ -300,15 +325,128 @@ class _HeroSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final Size size = MediaQuery.of(context).size;
-    final bool isMobile = size.width < 900;
+    final ScreenType screen = Responsive.of(context);
+    final bool isDesktop = screen == ScreenType.desktop;
+    final bool isTablet = screen == ScreenType.tablet;
+    final bool isMobile = screen == ScreenType.mobile;
+    final double viewportH = MediaQuery.of(context).size.height;
+    final double hPad = Responsive.hPadding(context);
+
+    final double headlineSize = Responsive.fluid(context, 40.0, 72.0);
+    final double bodySize = Responsive.value<double>(
+      context,
+      mobile: 17.0,
+      tablet: 19.0,
+      desktop: 20.0,
+    );
+    final double gapL = isMobile ? 20.0 : 30.0;
+
+    final Widget textColumn = SlideTransition(
+      position: heroSlide,
+      child: FadeTransition(
+        opacity: heroOpacity,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const _HeroBadge(text: "✨ DOCTOR ON CALL 24/7"),
+            SizedBox(height: gapL),
+            Text(
+              "The Doctor is\nJust a Phone\nCall Away.",
+              style: GoogleFonts.plusJakartaSans(
+                fontSize: headlineSize,
+                fontWeight: FontWeight.w800,
+                color: Colors.white,
+                height: 1.1,
+                letterSpacing: -headlineSize * 0.028,
+              ),
+            ),
+            SizedBox(height: gapL),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560.0),
+              child: Text(
+                "Speak directly to a licensed doctor for only KSH 54 per call. No waiting rooms, no travel—just professional care.",
+                style: TextStyle(
+                  fontSize: bodySize,
+                  color: Colors.white.withOpacity(0.8),
+                  height: 1.6,
+                  fontWeight: FontWeight.w300,
+                ),
+              ),
+            ),
+            SizedBox(height: isMobile ? 32.0 : 50.0),
+            const TypewriterPrompt(
+              baseColor: Colors.white,
+              accentColor: Color(0xFFF9A825),
+            ),
+            const SizedBox(height: 20.0),
+            // Wrap = side by side when there is room, stacked when there isn't.
+            Wrap(
+              spacing: 20.0,
+              runSpacing: 16.0,
+              children: [
+                ActionBtn(
+                  label: "Call Telmed (KSH 54)",
+                  iconData: Icons.phone_forwarded_rounded,
+                  color: const Color(0xFFF9A825),
+                  primary: true,
+                  onTap: onCallTap,
+                ),
+                ActionBtn(
+                  label: "Ask Telmed AI",
+                  iconData: Icons.smart_toy_outlined,
+                  color: Colors.white,
+                  primary: false,
+                  onTap: () {
+                    Navigator.pushNamed(context, '/ai_chat');
+                  },
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final Widget content = isDesktop
+        ? Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Expanded(flex: 11, child: textColumn),
+              const SizedBox(width: 40.0),
+              Expanded(
+                flex: 9,
+                child: Center(
+                  child: LayoutBuilder(
+                    builder: (BuildContext context, BoxConstraints c) {
+                      final double s =
+                          math.min(450.0, math.max(300.0, c.maxWidth));
+                      return _HeroVisualComposition(size: s);
+                    },
+                  ),
+                ),
+              ),
+            ],
+          )
+        : Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              textColumn,
+              if (isTablet) ...[
+                const SizedBox(height: 56.0),
+                const Center(child: _HeroVisualComposition(size: 340.0)),
+              ],
+            ],
+          );
+
+    // The hero is at least ~95% of the screen on desktop, but it GROWS if the
+    // content is taller (short laptop windows, big text sizes) instead of
+    // overflowing like a fixed height would.
+    final double minHeight =
+        isDesktop ? math.max(viewportH * 0.95, 640.0) : 0.0;
 
     return Container(
       width: double.infinity,
-      height: isMobile ? null : size.height * 0.95,
-      padding: isMobile
-          ? const EdgeInsets.only(top: 100.0, bottom: 80.0)
-          : null,
       decoration: const BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topLeft,
@@ -319,115 +457,24 @@ class _HeroSection extends StatelessWidget {
           ],
         ),
       ),
-      child: Stack(
-        children: [
-          Positioned.fill(
-            child: CustomPaint(
-              painter: _HeroAestheticPainter(),
+      child: CustomPaint(
+        painter: _HeroAestheticPainter(),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: minHeight),
+          child: Align(
+            alignment: Alignment.center,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(
+                maxWidth: Responsive.maxContentWidth,
+              ),
+              child: Padding(
+                // top padding clears the floating nav bar
+                padding: EdgeInsets.fromLTRB(hPad, isMobile ? 110.0 : 130.0, hPad, 90.0),
+                child: content,
+              ),
             ),
           ),
-          Padding(
-            padding: EdgeInsets.symmetric(
-              horizontal: isMobile ? 20.0 : 100.0,
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  flex: 1,
-                  child: SlideTransition(
-                    position: heroSlide,
-                    child: FadeTransition(
-                      opacity: heroOpacity,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          const _HeroBadge(
-                            text: "✨ DOCTOR ON CALL 24/7",
-                          ),
-                          const SizedBox(height: 30.0),
-                          Text(
-                            "The Doctor is\nJust a Phone\nCall Away.",
-                            style: GoogleFonts.plusJakartaSans(
-                              fontSize: isMobile ? 48.0 : 72.0,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.white,
-                              height: 1.1,
-                              letterSpacing: -2.0,
-                            ),
-                          ),
-                          const SizedBox(height: 30.0),
-                          Text(
-                            "Speak directly to a licensed doctor for only KSH 54 per call. No waiting rooms, no travel—just professional care.",
-                            style: TextStyle(
-                              fontSize: isMobile ? 18.0 : 20.0,
-                              color: Colors.white.withOpacity(0.8),
-                              height: 1.6,
-                              fontWeight: FontWeight.w300,
-                            ),
-                          ),
-                          const SizedBox(height: 50.0),
-                          const TypewriterPrompt(
-                            baseColor: Colors.white,
-                            accentColor: Color(0xFFF9A825),
-                          ),
-                          const SizedBox(height: 20.0),
-                          if (isMobile) ...[
-                            ActionBtn(
-                              label: "Call Telmed (KSH 54)",
-                              iconData: Icons.phone_forwarded_rounded,
-                              color: const Color(0xFFF9A825),
-                              primary: true,
-                              onTap: onCallTap,
-                            ),
-                            const SizedBox(height: 20.0),
-                            ActionBtn(
-                              label: "Ask Telmed AI",
-                              iconData: Icons.smart_toy_outlined,
-                              color: Colors.white,
-                              primary: false,
-                              onTap: () {
-                                Navigator.pushNamed(context, '/ai_chat');
-                              },
-                            ),
-                          ] else
-                            Row(
-                              children: [
-                                ActionBtn(
-                                  label: "Call Telmed (KSH 54)",
-                                  iconData: Icons.phone_forwarded_rounded,
-                                  color: const Color(0xFFF9A825),
-                                  primary: true,
-                                  onTap: onCallTap,
-                                ),
-                                const SizedBox(width: 25.0),
-                                ActionBtn(
-                                  label: "Ask Telmed AI",
-                                  iconData: Icons.smart_toy_outlined,
-                                  color: Colors.white,
-                                  primary: false,
-                                  onTap: () {
-                                    Navigator.pushNamed(context, '/ai_chat');
-                                  },
-                                ),
-                              ],
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                if (!isMobile)
-                  const Expanded(
-                    flex: 1,
-                    child: Center(
-                      child: _HeroVisualComposition(),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -489,49 +536,59 @@ class _HeroBadge extends StatelessWidget {
 }
 
 class _HeroVisualComposition extends StatelessWidget {
-  const _HeroVisualComposition();
+  /// Diameter of the outer ring. Everything inside scales from this.
+  final double size;
+
+  const _HeroVisualComposition({this.size = 450.0});
 
   @override
   Widget build(BuildContext context) {
-    return Stack(
-      alignment: Alignment.center,
-      children: [
-        Container(
-          width: 450.0,
-          height: 450.0,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: Colors.white.withOpacity(0.05),
+    final double outer = size;
+    final double mid = size * 0.78;
+    final double img = size * 0.667;
+
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Container(
+            width: outer,
+            height: outer,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Colors.white.withOpacity(0.05),
+            ),
           ),
-        ),
-        Container(
-          width: 350.0,
-          height: 350.0,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: Colors.white.withOpacity(0.1),
+          Container(
+            width: mid,
+            height: mid,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Colors.white.withOpacity(0.1),
+            ),
           ),
-        ),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(200.0),
-          child: Image.network(
-            'https://images.unsplash.com/photo-1559839734-2b71ea197ec2?q=80&w=2070&auto=format&fit=crop',
-            width: 300.0,
-            height: 300.0,
-            fit: BoxFit.cover,
+          ClipOval(
+            child: Image.network(
+              'https://images.unsplash.com/photo-1559839734-2b71ea197ec2?q=80&w=2070&auto=format&fit=crop',
+              width: img,
+              height: img,
+              fit: BoxFit.cover,
+            ),
           ),
-        ),
-        Positioned(
-          bottom: 40.0,
-          right: 0.0,
-          child: _GlassStatusChip("Verified Doctors", Icons.check_circle),
-        ),
-        Positioned(
-          top: 40.0,
-          left: 0.0,
-          child: _GlassStatusChip("Instant Access", Icons.flash_on),
-        ),
-      ],
+          Positioned(
+            bottom: size * 0.09,
+            right: 0.0,
+            child: const _GlassStatusChip("Verified Doctors", Icons.check_circle),
+          ),
+          Positioned(
+            top: size * 0.09,
+            left: 0.0,
+            child: const _GlassStatusChip("Instant Access", Icons.flash_on),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -544,48 +601,51 @@ class _TrustPulseBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
+    final bool isMobile = Responsive.isMobile(context);
+    final double hPad = Responsive.hPadding(context);
 
-    return Container(
-      transform: Matrix4.translationValues(0.0, -50.0, 0.0),
-      margin: EdgeInsets.symmetric(
-        horizontal: isMobile ? 20.0 : 100.0,
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: Responsive.maxContentWidth),
+        child: Container(
+          transform: Matrix4.translationValues(0.0, -50.0, 0.0),
+          margin: EdgeInsets.symmetric(horizontal: hPad),
+          padding: EdgeInsets.symmetric(
+            vertical: isMobile ? 36.0 : 50.0,
+            horizontal: isMobile ? 20.0 : 40.0,
+          ),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(30.0),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.08),
+                blurRadius: 80.0,
+                offset: const Offset(0.0, 20.0),
+              )
+            ],
+          ),
+          child: isMobile
+              ? const Column(
+                  children: [
+                    _StatBlock("2M+", "Call Consultations"),
+                    SizedBox(height: 30.0),
+                    _StatBlock("KSH 54", "Per Call Session"),
+                    SizedBox(height: 30.0),
+                    _StatBlock("60s", "Avg. Connection Time"),
+                  ],
+                )
+              : const Row(
+                  children: [
+                    Expanded(child: _StatBlock("2M+", "Call Consultations")),
+                    _StatDivider(),
+                    Expanded(child: _StatBlock("KSH 54", "Per Call Session")),
+                    _StatDivider(),
+                    Expanded(child: _StatBlock("60s", "Avg. Connection Time")),
+                  ],
+                ),
+        ),
       ),
-      padding: EdgeInsets.symmetric(
-        vertical: 50.0,
-        horizontal: isMobile ? 20.0 : 40.0,
-      ),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(30.0),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.08),
-            blurRadius: 80.0,
-            offset: const Offset(0.0, 20.0),
-          )
-        ],
-      ),
-      child: isMobile
-          ? const Column(
-              children: [
-                _StatBlock("2M+", "Call Consultations"),
-                SizedBox(height: 30.0),
-                _StatBlock("KSH 54", "Per Call Session"),
-                SizedBox(height: 30.0),
-                _StatBlock("60s", "Avg. Connection Time"),
-              ],
-            )
-          : const Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                _StatBlock("2M+", "Call Consultations"),
-                _StatDivider(),
-                _StatBlock("KSH 54", "Per Call Session"),
-                _StatDivider(),
-                _StatBlock("60s", "Avg. Connection Time"),
-              ],
-            ),
     );
   }
 }
@@ -602,8 +662,14 @@ class _StatBlock extends StatelessWidget {
       children: [
         Text(
           title,
+          textAlign: TextAlign.center,
           style: GoogleFonts.plusJakartaSans(
-            fontSize: 36.0,
+            fontSize: Responsive.value<double>(
+              context,
+              mobile: 32.0,
+              tablet: 32.0,
+              desktop: 36.0,
+            ),
             fontWeight: FontWeight.bold,
             color: const Color(0xFF2D7D46),
           ),
@@ -611,6 +677,7 @@ class _StatBlock extends StatelessWidget {
         const SizedBox(height: 8.0),
         Text(
           subtitle,
+          textAlign: TextAlign.center,
           style: const TextStyle(
             color: Colors.black54,
             fontWeight: FontWeight.w600,
@@ -638,18 +705,48 @@ class _StatDivider extends StatelessWidget {
 /// ----------------------------------------------------------------------
 /// SECTION 3: TELEMEDICINE SHOWCASE
 /// ----------------------------------------------------------------------
+class _Feature {
+  final IconData icon;
+  final String title;
+  final String desc;
+  final Color color;
+
+  const _Feature(this.icon, this.title, this.desc, this.color);
+}
+
+const List<_Feature> _features = [
+  _Feature(
+    Icons.phone_in_talk_outlined,
+    "Voice Call",
+    "Speak directly to a doctor for KSH 54.",
+    Color(0xFFF0F7F2),
+  ),
+  _Feature(
+    Icons.receipt_long_outlined,
+    "Digital Prescription",
+    "Receive prescriptions via SMS instantly.",
+    Color(0xFFFFF8E5),
+  ),
+  _Feature(
+    Icons.verified_user_outlined,
+    "Secure Records",
+    "Your medical data is encrypted & private.",
+    Color(0xFFF0F4FF),
+  ),
+  _Feature(
+    Icons.support_agent_outlined,
+    "24/7 Availability",
+    "Doctors are ready to answer anytime.",
+    Color(0xFFFFF0F0),
+  ),
+];
+
 class _TelemedicineShowcase extends StatelessWidget {
   const _TelemedicineShowcase();
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 1100;
-
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: 100.0,
-        horizontal: isMobile ? 20.0 : 100.0,
-      ),
+    return ResponsiveSection(
       child: Column(
         children: [
           const _SectionTitle(
@@ -658,37 +755,35 @@ class _TelemedicineShowcase extends StatelessWidget {
             subtitle:
                 "Tap 'Pigia Telmed' to start your consultation session instantly for just KSH 54.",
           ),
-          const SizedBox(height: 80.0),
-          Wrap(
-            spacing: 30.0,
-            runSpacing: 30.0,
-            alignment: WrapAlignment.center,
-            children: const [
-              _FeatureCard(
-                icon: Icons.phone_in_talk_outlined,
-                title: "Voice Call",
-                desc: "Speak directly to a doctor for KSH 54.",
-                color: Color(0xFFF0F7F2),
-              ),
-              _FeatureCard(
-                icon: Icons.receipt_long_outlined,
-                title: "Digital Prescription",
-                desc: "Receive prescriptions via SMS instantly.",
-                color: Color(0xFFFFF8E5),
-              ),
-              _FeatureCard(
-                icon: Icons.verified_user_outlined,
-                title: "Secure Records",
-                desc: "Your medical data is encrypted & private.",
-                color: Color(0xFFF0F4FF),
-              ),
-              _FeatureCard(
-                icon: Icons.support_agent_outlined,
-                title: "24/7 Availability",
-                desc: "Doctors are ready to answer anytime.",
-                color: Color(0xFFFFF0F0),
-              ),
-            ],
+          SizedBox(
+            height: Responsive.value<double>(
+              context,
+              mobile: 48.0,
+              tablet: 60.0,
+              desktop: 80.0,
+            ),
+          ),
+          // Card width is computed from the space actually available, so the
+          // grid is 1 / 2 / 4 columns and never overflows a narrow phone.
+          LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints c) {
+              const double gap = 24.0;
+              final int cols = c.maxWidth >= 1000.0
+                  ? 4
+                  : (c.maxWidth >= 520.0 ? 2 : 1);
+              final double w =
+                  ((c.maxWidth - gap * (cols - 1)) / cols).floorToDouble();
+
+              return Wrap(
+                spacing: gap,
+                runSpacing: gap,
+                alignment: WrapAlignment.center,
+                children: [
+                  for (final _Feature f in _features)
+                    _FeatureCard(width: w, feature: f),
+                ],
+              );
+            },
           ),
         ],
       ),
@@ -697,23 +792,16 @@ class _TelemedicineShowcase extends StatelessWidget {
 }
 
 class _FeatureCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String desc;
-  final Color color;
+  final double width;
+  final _Feature feature;
 
-  const _FeatureCard({
-    required this.icon,
-    required this.title,
-    required this.desc,
-    required this.color,
-  });
+  const _FeatureCard({required this.width, required this.feature});
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 280.0,
-      padding: const EdgeInsets.all(30.0),
+      width: width,
+      padding: const EdgeInsets.all(28.0),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(20.0),
@@ -734,18 +822,18 @@ class _FeatureCard extends StatelessWidget {
           Container(
             padding: const EdgeInsets.all(15.0),
             decoration: BoxDecoration(
-              color: color,
+              color: feature.color,
               shape: BoxShape.circle,
             ),
             child: Icon(
-              icon,
+              feature.icon,
               size: 30.0,
               color: Colors.black87,
             ),
           ),
           const SizedBox(height: 25.0),
           Text(
-            title,
+            feature.title,
             style: GoogleFonts.plusJakartaSans(
               fontSize: 20.0,
               fontWeight: FontWeight.bold,
@@ -754,7 +842,7 @@ class _FeatureCard extends StatelessWidget {
           ),
           const SizedBox(height: 15.0),
           Text(
-            desc,
+            feature.desc,
             style: const TextStyle(
               fontSize: 15.0,
               color: Colors.black54,
@@ -775,49 +863,61 @@ class _HomecareImmersiveSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
+    final bool isDesktop = Responsive.isDesktop(context);
+    final Widget image = _buildImage(context);
+    final Widget content = _buildContent(context, isDesktop);
 
-    return Container(
-      width: double.infinity,
-      padding: EdgeInsets.symmetric(
-        vertical: 120.0,
-        horizontal: isMobile ? 20.0 : 100.0,
-      ),
+    return ResponsiveSection(
       color: const Color(0xFFFAFAFA),
-      child: isMobile
-          ? Column(
+      verticalPadding: Responsive.value<double>(
+        context,
+        mobile: 64.0,
+        tablet: 90.0,
+        desktop: 120.0,
+      ),
+      child: isDesktop
+          ? Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                _buildImage(),
-                const SizedBox(height: 60.0),
-                _buildContent(isMobile),
+                Expanded(child: image),
+                const SizedBox(width: 80.0),
+                Expanded(child: content),
               ],
             )
-          : Row(
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Expanded(child: _buildImage()),
-                const SizedBox(width: 80.0),
-                Expanded(child: _buildContent(isMobile)),
+                image,
+                const SizedBox(height: 48.0),
+                content,
               ],
             ),
     );
   }
 
-  Widget _buildImage() {
+  Widget _buildImage(BuildContext context) {
+    final bool isMobile = Responsive.isMobile(context);
+
     return Stack(
       children: [
         ClipRRect(
-          borderRadius: BorderRadius.circular(40.0),
+          borderRadius: BorderRadius.circular(isMobile ? 28.0 : 40.0),
           child: Image.network(
             'https://images.unsplash.com/photo-1576091160550-2173dba999ef?q=80&w=2070&auto=format&fit=crop',
-            height: 450.0,
+            height: Responsive.value<double>(
+              context,
+              mobile: 280.0,
+              tablet: 380.0,
+              desktop: 450.0,
+            ),
             width: double.infinity,
             fit: BoxFit.cover,
           ),
         ),
-        const Positioned(
-          top: 30.0,
-          right: 30.0,
-          child: _GlassStatusChip(
+        Positioned(
+          top: isMobile ? 16.0 : 30.0,
+          right: isMobile ? 16.0 : 30.0,
+          child: const _GlassStatusChip(
             "Mobile Lab Active",
             Icons.biotech_rounded,
           ),
@@ -826,16 +926,19 @@ class _HomecareImmersiveSection extends StatelessWidget {
     );
   }
 
-  Widget _buildContent(bool isMobile) {
+  Widget _buildContent(BuildContext context, bool isDesktop) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const _SectionLabel("PREMIUM HOMECARE"),
         const SizedBox(height: 20.0),
         Text(
-          "We Bring The Entire\nHospital To You.",
+          // the manual line break only makes sense when there is room for it
+          isDesktop
+              ? "We Bring The Entire\nHospital To You."
+              : "We Bring The Entire Hospital To You.",
           style: GoogleFonts.plusJakartaSans(
-            fontSize: isMobile ? 36.0 : 48.0,
+            fontSize: Responsive.fluid(context, 32.0, 48.0),
             fontWeight: FontWeight.w800,
             height: 1.1,
           ),
@@ -930,13 +1033,8 @@ class _HybridCarePhilosophy extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
-
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: 100.0,
-        horizontal: isMobile ? 20.0 : 100.0,
-      ),
+    return ResponsiveSection(
+      maxWidth: 1000.0,
       child: Column(
         children: [
           const _SectionTitle(
@@ -945,9 +1043,24 @@ class _HybridCarePhilosophy extends StatelessWidget {
             subtitle:
                 "We believe 80% of healthcare needs can be solved over a phone call.",
           ),
-          const SizedBox(height: 60.0),
+          SizedBox(
+            height: Responsive.value<double>(
+              context,
+              mobile: 40.0,
+              tablet: 50.0,
+              desktop: 60.0,
+            ),
+          ),
           Container(
-            padding: const EdgeInsets.all(40.0),
+            width: double.infinity,
+            padding: EdgeInsets.all(
+              Responsive.value<double>(
+                context,
+                mobile: 24.0,
+                tablet: 32.0,
+                desktop: 40.0,
+              ),
+            ),
             decoration: BoxDecoration(
               color: Colors.white,
               borderRadius: BorderRadius.circular(30.0),
@@ -959,7 +1072,12 @@ class _HybridCarePhilosophy extends StatelessWidget {
               "By eliminating waiting rooms, we save you time and money. Start with a KSH 54 call. If your condition is complex, we escalate it to physical home care or a specialist referral automatically.",
               textAlign: TextAlign.center,
               style: GoogleFonts.plusJakartaSans(
-                fontSize: 22.0,
+                fontSize: Responsive.value<double>(
+                  context,
+                  mobile: 17.0,
+                  tablet: 20.0,
+                  desktop: 22.0,
+                ),
                 color: Colors.black87,
                 height: 1.6,
                 fontWeight: FontWeight.w500,
@@ -980,15 +1098,19 @@ class _ModernStepProcess extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
+    final bool isMobile = Responsive.isMobile(context);
 
-    return Container(
-      width: double.infinity,
+    final List<Widget> steps = [
+      _buildStep(context, "01", "Request Call",
+          "Tap the Call button and enter your issue."),
+      _buildStep(context, "02", "Pay KSH 54",
+          "Process secure payment via M-Pesa."),
+      _buildStep(context, "03", "Consult & Heal",
+          "Speak to a doctor and get your prescription."),
+    ];
+
+    return ResponsiveSection(
       color: const Color(0xFFF0F7F2),
-      padding: EdgeInsets.symmetric(
-        vertical: 100.0,
-        horizontal: isMobile ? 20.0 : 100.0,
-      ),
       child: Column(
         children: [
           const _SectionTitle(
@@ -996,84 +1118,83 @@ class _ModernStepProcess extends StatelessWidget {
             title: "3 Simple Steps",
             subtitle: "Getting care has never been easier.",
           ),
-          const SizedBox(height: 80.0),
-          isMobile
-              ? Column(
-                  children: [
-                    _buildStep(
-                      "01",
-                      "Request Call",
-                      "Tap the Call button and enter your issue.",
-                    ),
-                    const SizedBox(height: 40.0),
-                    _buildStep(
-                      "02",
-                      "Pay KSH 54",
-                      "Process secure payment via M-Pesa.",
-                    ),
-                    const SizedBox(height: 40.0),
-                    _buildStep(
-                      "03",
-                      "Consult & Heal",
-                      "Speak to a doctor and get your prescription.",
-                    ),
-                  ],
-                )
-              : Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: [
-                    _buildStep(
-                      "01",
-                      "Request Call",
-                      "Tap the Call button and enter your issue.",
-                    ),
-                    _buildStep(
-                      "02",
-                      "Pay KSH 54",
-                      "Process secure payment via M-Pesa.",
-                    ),
-                    _buildStep(
-                      "03",
-                      "Consult & Heal",
-                      "Speak to a doctor and get your prescription.",
-                    ),
-                  ],
-                ),
+          SizedBox(
+            height: Responsive.value<double>(
+              context,
+              mobile: 48.0,
+              tablet: 60.0,
+              desktop: 80.0,
+            ),
+          ),
+          if (isMobile)
+            Column(
+              children: [
+                steps[0],
+                const SizedBox(height: 40.0),
+                steps[1],
+                const SizedBox(height: 40.0),
+                steps[2],
+              ],
+            )
+          else
+            // Expanded => each step gets an equal share and its text wraps,
+            // instead of three unconstrained columns overflowing the row.
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final Widget s in steps) Expanded(child: s),
+              ],
+            ),
         ],
       ),
     );
   }
 
-  Widget _buildStep(String number, String title, String description) {
-    return Column(
-      children: [
-        Text(
-          number,
-          style: GoogleFonts.plusJakartaSans(
-            fontSize: 60.0,
-            fontWeight: FontWeight.w900,
-            color: const Color(0xFF2D7D46).withOpacity(0.2),
+  Widget _buildStep(
+    BuildContext context,
+    String number,
+    String title,
+    String description,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16.0),
+      child: Column(
+        children: [
+          Text(
+            number,
+            style: GoogleFonts.plusJakartaSans(
+              fontSize: Responsive.value<double>(
+                context,
+                mobile: 48.0,
+                tablet: 56.0,
+                desktop: 60.0,
+              ),
+              fontWeight: FontWeight.w900,
+              color: const Color(0xFF2D7D46).withOpacity(0.2),
+            ),
           ),
-        ),
-        const SizedBox(height: 20.0),
-        Text(
-          title,
-          style: const TextStyle(
-            fontSize: 22.0,
-            fontWeight: FontWeight.bold,
-            color: Color(0xFF0F172A),
+          const SizedBox(height: 20.0),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 22.0,
+              fontWeight: FontWeight.bold,
+              color: Color(0xFF0F172A),
+            ),
           ),
-        ),
-        const SizedBox(height: 10.0),
-        Text(
-          description,
-          textAlign: TextAlign.center,
-          style: const TextStyle(
-            color: Colors.black54,
-            fontSize: 16.0,
+          const SizedBox(height: 10.0),
+          Text(
+            description,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.black54,
+              fontSize: 16.0,
+              height: 1.5,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }
@@ -1086,12 +1207,12 @@ class _ElitePricingModule extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
-
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: 120.0,
-        horizontal: isMobile ? 20.0 : 100.0,
+    return ResponsiveSection(
+      verticalPadding: Responsive.value<double>(
+        context,
+        mobile: 64.0,
+        tablet: 90.0,
+        desktop: 120.0,
       ),
       child: Column(
         children: [
@@ -1100,43 +1221,42 @@ class _ElitePricingModule extends StatelessWidget {
             title: "Affordable Healthcare.",
             subtitle: "No hidden fees. Quality care for everyone.",
           ),
-          const SizedBox(height: 80.0),
-          isMobile
-              ? Column(
-                  children: const [
-                    _PricingCard(
-                      title: "Voice Consult",
-                      price: "KSH 54",
-                      desc: "Per Call Session",
-                      isHighlighted: true,
-                    ),
-                    SizedBox(height: 30.0),
-                    _PricingCard(
-                      title: "Home Visit",
-                      price: "KSH 1500",
-                      desc: "Base Nursing Fee",
-                      isHighlighted: false,
-                    ),
-                  ],
-                )
-              : Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: const [
-                    _PricingCard(
-                      title: "Voice Consult",
-                      price: "KSH 54",
-                      desc: "Per Call Session",
-                      isHighlighted: true,
-                    ),
-                    SizedBox(width: 40.0),
-                    _PricingCard(
-                      title: "Home Visit",
-                      price: "KSH 1500",
-                      desc: "Base Nursing Fee",
-                      isHighlighted: false,
-                    ),
-                  ],
-                ),
+          SizedBox(
+            height: Responsive.value<double>(
+              context,
+              mobile: 48.0,
+              tablet: 60.0,
+              desktop: 80.0,
+            ),
+          ),
+          // Cards are max 350 wide but shrink to fit a narrow phone, and Wrap
+          // puts them side by side or stacked depending on the room.
+          LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints c) {
+              final double w = math.min(350.0, c.maxWidth);
+              return Wrap(
+                spacing: 30.0,
+                runSpacing: 30.0,
+                alignment: WrapAlignment.center,
+                children: [
+                  _PricingCard(
+                    width: w,
+                    title: "Voice Consult",
+                    price: "KSH 54",
+                    desc: "Per Call Session",
+                    isHighlighted: true,
+                  ),
+                  _PricingCard(
+                    width: w,
+                    title: "Home Visit",
+                    price: "KSH 1500",
+                    desc: "Base Nursing Fee",
+                    isHighlighted: false,
+                  ),
+                ],
+              );
+            },
+          ),
         ],
       ),
     );
@@ -1144,12 +1264,14 @@ class _ElitePricingModule extends StatelessWidget {
 }
 
 class _PricingCard extends StatelessWidget {
+  final double width;
   final String title;
   final String price;
   final String desc;
   final bool isHighlighted;
 
   const _PricingCard({
+    required this.width,
     required this.title,
     required this.price,
     required this.desc,
@@ -1158,9 +1280,11 @@ class _PricingCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final bool isMobile = Responsive.isMobile(context);
+
     return Container(
-      width: 350.0,
-      padding: const EdgeInsets.all(50.0),
+      width: width,
+      padding: EdgeInsets.all(isMobile ? 32.0 : 50.0),
       decoration: BoxDecoration(
         color: isHighlighted ? const Color(0xFF2D7D46) : Colors.white,
         borderRadius: BorderRadius.circular(30.0),
@@ -1183,6 +1307,7 @@ class _PricingCard extends StatelessWidget {
         children: [
           Text(
             title,
+            textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 20.0,
               fontWeight: FontWeight.bold,
@@ -1192,8 +1317,9 @@ class _PricingCard extends StatelessWidget {
           const SizedBox(height: 30.0),
           Text(
             price,
+            textAlign: TextAlign.center,
             style: GoogleFonts.plusJakartaSans(
-              fontSize: 48.0,
+              fontSize: isMobile ? 40.0 : 48.0,
               fontWeight: FontWeight.w900,
               color: isHighlighted ? Colors.white : const Color(0xFF2D7D46),
             ),
@@ -1201,6 +1327,7 @@ class _PricingCard extends StatelessWidget {
           const SizedBox(height: 10.0),
           Text(
             desc,
+            textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 16.0,
               color: isHighlighted
@@ -1298,11 +1425,17 @@ class _TestimonialWallState extends State<_TestimonialWall> {
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
+    final bool isMobile = Responsive.isMobile(context);
     final int realIndex = _virtualIndex % _testimonials.length;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 120.0),
+    return ResponsiveSection(
+      maxWidth: 1100.0,
+      verticalPadding: Responsive.value<double>(
+        context,
+        mobile: 64.0,
+        tablet: 90.0,
+        desktop: 120.0,
+      ),
       child: Column(
         children: [
           const _SectionTitle(
@@ -1310,24 +1443,28 @@ class _TestimonialWallState extends State<_TestimonialWall> {
             title: "Loved by Millions",
             subtitle: "Swipe through stories from our global community.",
           ),
-          const SizedBox(height: 60.0),
+          SizedBox(height: isMobile ? 40.0 : 60.0),
           SizedBox(
-            height: 350.0,
+            height: Responsive.value<double>(
+              context,
+              mobile: 330.0,
+              tablet: 340.0,
+              desktop: 350.0,
+            ),
             child: Row(
               children: [
-                if (!isMobile)
-                  Padding(
-                    padding: const EdgeInsets.only(left: 40.0),
-                    child: _NavBtn(
-                      icon: Icons.arrow_back_ios,
-                      onTap: () {
-                        _pageController.previousPage(
-                          duration: const Duration(milliseconds: 500),
-                          curve: Curves.ease,
-                        );
-                      },
-                    ),
+                if (!isMobile) ...[
+                  _NavBtn(
+                    icon: Icons.arrow_back_ios,
+                    onTap: () {
+                      _pageController.previousPage(
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.ease,
+                      );
+                    },
                   ),
+                  const SizedBox(width: 16.0),
+                ],
                 Expanded(
                   child: PageView.builder(
                     controller: _pageController,
@@ -1339,33 +1476,31 @@ class _TestimonialWallState extends State<_TestimonialWall> {
                     itemBuilder: (BuildContext context, int index) {
                       final Map<String, String> t =
                           _testimonials[index % _testimonials.length];
-                      return Container(
-                        width: double.infinity,
+                      return Padding(
                         padding: EdgeInsets.symmetric(
-                          horizontal: isMobile ? 20.0 : 100.0,
+                          horizontal: isMobile ? 0.0 : 8.0,
                         ),
                         child: _ReviewCard(t['name']!, t['text']!),
                       );
                     },
                   ),
                 ),
-                if (!isMobile)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 40.0),
-                    child: _NavBtn(
-                      icon: Icons.arrow_forward_ios,
-                      onTap: () {
-                        _pageController.nextPage(
-                          duration: const Duration(milliseconds: 500),
-                          curve: Curves.ease,
-                        );
-                      },
-                    ),
+                if (!isMobile) ...[
+                  const SizedBox(width: 16.0),
+                  _NavBtn(
+                    icon: Icons.arrow_forward_ios,
+                    onTap: () {
+                      _pageController.nextPage(
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.ease,
+                      );
+                    },
                   ),
+                ],
               ],
             ),
           ),
-          const SizedBox(height: 40.0),
+          const SizedBox(height: 32.0),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: List.generate(
@@ -1430,7 +1565,14 @@ class _ReviewCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(40.0),
+      padding: EdgeInsets.all(
+        Responsive.value<double>(
+          context,
+          mobile: 24.0,
+          tablet: 32.0,
+          desktop: 40.0,
+        ),
+      ),
       decoration: BoxDecoration(
         color: const Color(0xFFFAFAFA),
         borderRadius: BorderRadius.circular(30.0),
@@ -1447,17 +1589,22 @@ class _ReviewCard extends StatelessWidget {
             color: Color(0xFFF9A825),
             size: 30.0,
           ),
-          const SizedBox(height: 30.0),
+          const SizedBox(height: 24.0),
           Text(
             '"$text"',
             textAlign: TextAlign.center,
             style: GoogleFonts.plusJakartaSans(
-              fontSize: 20.0,
+              fontSize: Responsive.value<double>(
+                context,
+                mobile: 17.0,
+                tablet: 19.0,
+                desktop: 20.0,
+              ),
               fontStyle: FontStyle.italic,
               color: Colors.black87,
             ),
           ),
-          const SizedBox(height: 30.0),
+          const SizedBox(height: 24.0),
           Text(
             name,
             style: const TextStyle(
@@ -1517,15 +1664,22 @@ class _FaqSection extends StatelessWidget {
     },
   ];
 
+  List<Widget> _tiles(List<Map<String, String>> items) => items
+      .map((Map<String, String> d) => _FaqTile(d['q']!, d['a']!))
+      .toList();
+
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
+    final bool isMobile = Responsive.isMobile(context);
     final int midPoint = (_faqData.length / 2).ceil();
 
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: 120.0,
-        horizontal: isMobile ? 20.0 : 100.0,
+    return ResponsiveSection(
+      maxWidth: 1100.0,
+      verticalPadding: Responsive.value<double>(
+        context,
+        mobile: 64.0,
+        tablet: 90.0,
+        desktop: 120.0,
       ),
       child: Column(
         children: [
@@ -1534,41 +1688,29 @@ class _FaqSection extends StatelessWidget {
             title: "Everything You Need to Know",
             subtitle: "Answers to the 9 most common questions our patients ask.",
           ),
-          const SizedBox(height: 80.0),
-          Flex(
-            direction: isMobile ? Axis.vertical : Axis.horizontal,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (isMobile)
-                Column(
-                  children: _faqData
-                      .map((Map<String, String> d) =>
-                          _FaqTile(d['q']!, d['a']!))
-                      .toList(),
-                )
-              else ...[
-                Expanded(
-                  child: Column(
-                    children: _faqData
-                        .sublist(0, midPoint)
-                        .map((Map<String, String> d) =>
-                            _FaqTile(d['q']!, d['a']!))
-                        .toList(),
-                  ),
-                ),
-                const SizedBox(width: 40.0),
-                Expanded(
-                  child: Column(
-                    children: _faqData
-                        .sublist(midPoint)
-                        .map((Map<String, String> d) =>
-                            _FaqTile(d['q']!, d['a']!))
-                        .toList(),
-                  ),
-                ),
-              ]
-            ],
+          SizedBox(
+            height: Responsive.value<double>(
+              context,
+              mobile: 40.0,
+              tablet: 60.0,
+              desktop: 80.0,
+            ),
           ),
+          if (isMobile)
+            Column(children: _tiles(_faqData))
+          else
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(children: _tiles(_faqData.sublist(0, midPoint))),
+                ),
+                const SizedBox(width: 24.0),
+                Expanded(
+                  child: Column(children: _tiles(_faqData.sublist(midPoint))),
+                ),
+              ],
+            ),
         ],
       ),
     );
@@ -1644,8 +1786,6 @@ class _SectionTitle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool isMobile = MediaQuery.of(context).size.width < 900;
-
     return Column(
       children: [
         _SectionLabel(label),
@@ -1654,18 +1794,28 @@ class _SectionTitle extends StatelessWidget {
           title,
           textAlign: TextAlign.center,
           style: GoogleFonts.plusJakartaSans(
-            fontSize: isMobile ? 36.0 : 48.0,
+            fontSize: Responsive.fluid(context, 30.0, 48.0),
             fontWeight: FontWeight.w800,
             color: const Color(0xFF0F172A),
+            height: 1.15,
           ),
         ),
         const SizedBox(height: 15.0),
-        Text(
-          subtitle,
-          textAlign: TextAlign.center,
-          style: const TextStyle(
-            fontSize: 18.0,
-            color: Colors.black54,
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 640.0),
+          child: Text(
+            subtitle,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: Responsive.value<double>(
+                context,
+                mobile: 16.0,
+                tablet: 17.0,
+                desktop: 18.0,
+              ),
+              color: Colors.black54,
+              height: 1.5,
+            ),
           ),
         ),
       ],

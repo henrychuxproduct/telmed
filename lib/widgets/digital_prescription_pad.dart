@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../services/prescription_service.dart'; 
 
@@ -13,6 +14,15 @@ class DigitalPrescriptionPad extends StatefulWidget {
 
 class _DigitalPrescriptionPadState extends State<DigitalPrescriptionPad> {
   final PrescriptionService _prescriptionService = PrescriptionService();
+
+  // The real signed-in doctor (was hard-coded to "Dr. Doctor" before).
+  String get _doctorName {
+    final String n = FirebaseAuth.instance.currentUser?.displayName?.trim() ?? '';
+    if (n.isEmpty) return 'Doctor';
+    return n.toLowerCase().startsWith('dr') ? n : 'Dr. $n';
+  }
+
+  String? get _doctorUid => FirebaseAuth.instance.currentUser?.uid;
 
   // --- CONTROLLERS ---
   final TextEditingController _patientAgeController = TextEditingController(); 
@@ -46,7 +56,8 @@ class _DigitalPrescriptionPadState extends State<DigitalPrescriptionPad> {
     
     await _prescriptionService.savePrescription(
       roomId: widget.roomId,
-      doctorId: "Dr. Doctor", 
+      doctorId: _doctorName,
+        doctorUid: _doctorUid,
       patientAge: _patientAgeController.text.trim(), 
       medications: _prescribedItems,
       doctorNotes: _notesController.text.trim(),
@@ -125,7 +136,8 @@ class _DigitalPrescriptionPadState extends State<DigitalPrescriptionPad> {
     try {
       bool success = await _prescriptionService.savePrescription(
         roomId: widget.roomId,
-        doctorId: "Dr. Doctor", 
+        doctorId: _doctorName,
+        doctorUid: _doctorUid,
         patientAge: _patientAgeController.text.trim(), 
         medications: _prescribedItems,
         doctorNotes: _notesController.text.trim(),

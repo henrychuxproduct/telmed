@@ -3,9 +3,10 @@ import 'package:google_fonts/google_fonts.dart';
 import 'dart:ui';
 import 'dart:async';
 
+import '../utils/responsive.dart';
+
 // FIXED IMPORTS: Since these files are in the same folder (lib/widgets/), 
 // we just import them by name.
-import 'call_overlay.dart';
 import 'join_overlay.dart';
 import 'package:telmed/pages/rx_verification_scanner.dart'; // Imported the scanner page
 
@@ -58,7 +59,14 @@ class TelmedNavBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final bool isScrolled = navOpacity > 0.5;
     final double screenWidth = MediaQuery.of(context).size.width;
-    final bool isMobile = screenWidth < 800;
+
+    // Full inline menu only where it really fits (>= 1024). Phones AND
+    // tablets get the compact bar + drawer, so nothing overflows in between.
+    final bool isDesktop = Responsive.isDesktop(context);
+    final bool showCompactCta = !isDesktop && screenWidth >= 420;
+
+    final double hPad = screenWidth < 600 ? 20 : (screenWidth < 1280 ? 32 : 60);
+    final double itemPad = screenWidth < 1200 ? 12 : 20;
 
     return Positioned(
       top: 0, left: 0, right: 0,
@@ -67,10 +75,7 @@ class TelmedNavBar extends StatelessWidget {
           filter: ImageFilter.blur(sigmaX: 10 * navOpacity, sigmaY: 10 * navOpacity),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 200),
-            padding: EdgeInsets.symmetric(
-              horizontal: isMobile ? 20 : 60, 
-              vertical: 20
-            ),
+            padding: EdgeInsets.symmetric(horizontal: hPad, vertical: 20),
             decoration: BoxDecoration(
               color: Colors.white.withOpacity(navOpacity * 0.8),
               border: Border(bottom: BorderSide(color: isScrolled ? Colors.black12 : Colors.transparent)),
@@ -79,51 +84,35 @@ class TelmedNavBar extends StatelessWidget {
               child: Row(
                 children: [
                   BrandLogo(
-                    isDark: isScrolled ? true : false, 
-                    height: 35, 
-                    showName: true
-                  ), 
+                    isDark: isScrolled,
+                    height: 35,
+                    showName: true,
+                  ),
                   const Spacer(),
-                  if (!isMobile) ...[
-                    _navItem("Services", isScrolled),
-                    _navItem("Homecare", isScrolled),
-                    _navItem("Pricing", isScrolled),
-                    const SizedBox(width: 30),
-                  ],
-                  
-                  // --- TESTING BUTTON FOR DOCTORS ---
-                  if (!isMobile) const DoctorTestBtn(),
-                  
-                  if (!isMobile) const SizedBox(width: 15),
+                  if (isDesktop) ...[
+                    _navItem("Services", isScrolled, itemPad),
+                    _navItem("Homecare", isScrolled, itemPad),
+                    _navItem("Pricing", isScrolled, itemPad),
+                    const SizedBox(width: 24),
 
-                  // --- VERIFY RX SCANNER BUTTON ---
-                  if (!isMobile) const VerifyRxBtn(),
-
-                  // --- DESKTOP GET STARTED BUTTON ---
-                  if (!isMobile) ...[
+                    // --- TESTING BUTTON FOR DOCTORS ---
+                    const DoctorTestBtn(),
                     const SizedBox(width: 15),
-                    ElevatedButton(
-                      onPressed: () {
-                        // Routing to the auth page
-                        Navigator.pushNamed(context, '/auth');
-                      },
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF2D7D46),
-                        foregroundColor: Colors.white,
-                        elevation: 0,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15)
-                      ),
-                      child: const Text("Get Started", style: TextStyle(fontWeight: FontWeight.bold)),
-                    ),
-                  ],
-                  
-                  // --- MOBILE MENU ICON ONLY ---
-                  if (isMobile)
+
+                    // --- VERIFY RX SCANNER BUTTON ---
+                    const VerifyRxBtn(),
+                    const SizedBox(width: 15),
+
+                    _getStartedButton(context),
+                  ] else ...[
+                    if (showCompactCta) _getStartedButton(context),
+
+                    // --- MENU ICON (phones + tablets) ---
                     IconButton(
                       icon: Icon(Icons.menu, color: isScrolled ? Colors.black : Colors.white),
                       onPressed: () => Scaffold.of(context).openEndDrawer(),
-                    )
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -133,9 +122,26 @@ class TelmedNavBar extends StatelessWidget {
     );
   }
 
-  Widget _navItem(String label, bool isScrolled) {
+  Widget _getStartedButton(BuildContext context) {
+    return ElevatedButton(
+      onPressed: () {
+        // Routing to the auth page
+        Navigator.pushNamed(context, '/auth');
+      },
+      style: ElevatedButton.styleFrom(
+        backgroundColor: const Color(0xFF2D7D46),
+        foregroundColor: Colors.white,
+        elevation: 0,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+      ),
+      child: const Text("Get Started", style: TextStyle(fontWeight: FontWeight.bold)),
+    );
+  }
+
+  Widget _navItem(String label, bool isScrolled, double horizontalPadding) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 20),
+      padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
       child: Text(
         label,
         style: TextStyle(
@@ -219,20 +225,23 @@ class ActionBtn extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final bool isMobile = Responsive.isMobile(context);
+
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       child: GestureDetector(
         // NEW: If onTap is provided, use it. Otherwise, default to CallOverlay
+        // The default used to open the call screen with NO payment check
+        // (e.g. "Book a Home Visit" gave a free call). Calls now only start
+        // from the verified M-Pesa flow on the home page.
         onTap: onTap ?? () {
-          showDialog(
-            context: context,
-            barrierDismissible: false,
-            builder: (context) => const CallOverlay(),
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Home visit booking is coming soon.")),
           );
         },
         child: Container(
           height: 60,
-          padding: const EdgeInsets.symmetric(horizontal: 25),
+          padding: EdgeInsets.symmetric(horizontal: isMobile ? 20 : 25),
           decoration: BoxDecoration(
             color: primary ? color : Colors.transparent,
             borderRadius: BorderRadius.circular(15),
@@ -244,12 +253,18 @@ class ActionBtn extends StatelessWidget {
               if (iconUrl != null) Image.network(iconUrl!, height: 22, width: 22),
               if (iconData != null) Icon(iconData, color: primary ? Colors.white : const Color(0xFFF9A825), size: 20),
               const SizedBox(width: 12),
-              Text(
-                label,
-                style: GoogleFonts.plusJakartaSans(
-                  color: primary ? Colors.white : Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 16,
+              // Flexible + ellipsis: on a very narrow screen the label shrinks
+              // instead of throwing a RenderFlex overflow.
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.plusJakartaSans(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
                 ),
               ),
             ],
